@@ -4,8 +4,8 @@ import { supabase } from '../lib/supabase';
 
 const Login: React.FC = () => {
   const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [error, setError] = useState('');
-  const [message, setMessage] = useState('');
   const [isLoading, setIsLoading] = useState(false);
 
   const normalizedEmail = email.trim().toLowerCase();
@@ -13,10 +13,14 @@ const Login: React.FC = () => {
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
-    setMessage('');
 
     if (!email) {
       setError("Por favor, insira um e-mail.");
+      return;
+    }
+
+    if (!password) {
+      setError("Por favor, insira sua senha.");
       return;
     }
 
@@ -27,17 +31,14 @@ const Login: React.FC = () => {
 
     setIsLoading(true);
     try {
-      const { error: signInError } = await supabase.auth.signInWithOtp({
+      const { error: signInError } = await supabase.auth.signInWithPassword({
         email: normalizedEmail,
-        options: {
-          emailRedirectTo: window.location.origin
-        }
+        password
       });
 
       if (signInError) throw signInError;
-      setMessage("Enviamos um link de acesso para o seu e-mail.");
     } catch (err: any) {
-      setError(err.message || "Nao foi possivel enviar o link de acesso.");
+      setError(err.message || "E-mail ou senha invalidos.");
     } finally {
       setIsLoading(false);
     }
@@ -70,6 +71,19 @@ const Login: React.FC = () => {
                 onChange={(e) => setEmail(e.target.value)}
               />
             </div>
+            <div>
+              <label htmlFor="password" className="sr-only">Senha</label>
+              <input
+                id="password"
+                name="password"
+                type="password"
+                required
+                className="appearance-none rounded-b relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 focus:outline-none focus:ring-red-500 focus:border-red-500 sm:text-sm"
+                placeholder="Senha"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+              />
+            </div>
           </div>
 
           {error && (
@@ -78,19 +92,13 @@ const Login: React.FC = () => {
               {error}
             </div>
           )}
-          {message && (
-            <div className="text-green-700 text-sm text-center bg-green-50 p-2 rounded">
-              {message}
-            </div>
-          )}
-
           <div>
             <button
               type="submit"
               disabled={isLoading}
               className="group relative w-full flex justify-center py-2 px-4 border border-transparent text-sm font-medium rounded-md text-white bg-red-700 hover:bg-red-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500 transition-colors shadow-sm"
             >
-              {isLoading ? 'Enviando...' : 'Entrar'}
+              {isLoading ? 'Entrando...' : 'Entrar'}
             </button>
           </div>
         </form>
