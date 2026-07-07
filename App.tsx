@@ -1,0 +1,767 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { parseCSV, calculateSummary } from './services/dataProcessor';
+import { TimeEntry, EmployeeConfig, ClientConfig, UserSession, SystemBackup, HealthInput } from './types';
+import FileUpload from './components/FileUpload';
+import EkyteSyncButton from './components/EkyteSyncButton';
+import Dashboard from './components/Dashboard';
+import Settings from './components/Settings';
+import Login from './components/Login';
+import HealthDashboard from './components/HealthDashboard';
+import { LayoutDashboard, Settings as SettingsIcon, LogOut, RefreshCw, Cloud, CloudOff, Info, HeartPulse, BarChart2 } from 'lucide-react';
+import { supabase } from './lib/supabase';
+import { syncEkyteData } from './services/ekyteSync';
+
+const DATE_INPUT_STYLE = "bg-gray-700 text-white border-gray-600 rounded-md shadow-sm focus:ring-red-500 focus:border-red-500 sm:text-sm p-1 border";
+const HEALTH_SCORE_AVAILABLE = false;
+
+const App: React.FC = () => {
+  // Auth State
+  const [session, setSession] = useState<UserSession | null>(null);
+
+  // App State
+  const [entries, setEntries] = useState<TimeEntry[]>([]);
+  const [employees, setEmployees] = useState<EmployeeConfig[]>([]);
+  const [clients, setClients] = useState<ClientConfig[]>([]);
+  const [healthInputs, setHealthInputs] = useState<Record<string, HealthInput>>({});
+  const [allHealthInputs, setAllHealthInputs] = useState<HealthInput[]>([]);
+  const [healthHistory, setHealthHistory] = useState<any[]>([]);
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'health' | 'settings'>('dashboard');
+  const [currentModule, setCurrentModule] = useState<'none' | 'productivity' | 'health'>('none');
+  
+  // Date Filtering
+  const [startDate, setStartDate] = useState<string>('');
+  const [endDate, setEndDate] = useState<string>('');
+  
+  // Sync State
+  const [statusMsg, setStatusMsg] = useState<string | null>(null);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [lastSync, setLastSync] = useState<string>('');
+
+  // Detect Offline/Test Mode based on Supabase URL
+  // @ts-ignore
+  const isOfflineMode = !supabase.supabaseUrl || supabase.supabaseUrl.includes('placeholder');
+
+  // Initial Load from Cloud
+  useEffect(() => {
+    if (session?.isAuthenticated) {
+        if (isOfflineMode) {
+            console.log("App em Modo Offline: Pulando busca inicial de dados.");
+            return;
+        }
+        fetchCloudData();
+        fetchHealthInputs();
+        fetchHealthHistory();
+    }
+  }, [session]); // isOfflineMode é constante, não precisa estar na dependência
+
+  const fetchHealthHistory = async () => {
+      try {
+          const { data, error } = await supabase
+              .from('health_score_history')
+              .select('*')
+              .order('changed_at', { ascending: false })
+              .limit(200);
+          if (error) throw error;
+          if (data) setHealthHistory(data);
+      } catch (err) {
+          console.error("Erro ao buscar histórico de health score:", err);
+      }
+  };
+
+  const fetchHealthInputs = async () => {
+      try {
+          const { data, error } = await supabase.from('health_inputs').select('*').order('month_key', { ascending: true });
+          if (error) throw error;
+          if (data) {
+              console.log('[HS-FETCH] Total linhas recebidas do banco:', data.length);
+              // Log de clientes com múltiplas entradas (possível causa de conflito)
+              const counts: Record<string, number> = {};
+              data.forEach((r: any) => { counts[r.client_id] = (counts[r.client_id] || 0) + 1; });
+              const duplicates = Object.entries(counts).filter(([, c]) => c > 1);
+              if (duplicates.length > 0) console.warn('[HS-FETCH] ⚠️ Clientes com múltiplas linhas:', duplicates);
+              const allInputs: HealthInput[] = data.map((row: any) => ({
+                  clientId: row.client_id,
+                  monthKey: row.month_key,
+                  checkin: row.checkin,
+                  whatsapp: row.whatsapp,
+                  adimplencia: row.adimplencia,
+                  recarga: row.recarga,
+                  roi_bucket: row.roi_bucket,
+                  growth: row.growth,
+                  engagement_vs_avg: row.engagement_vs_avg,
+                  checkin_produtivo: row.checkin_produtivo,
+                  progresso: row.progresso,
+                  relacionamento_interno: row.relacionamento_interno,
+                  aviso_previo: row.aviso_previo,
+                  pesquisa_respondida: row.pesquisa_respondida,
+                  csat_tecnico: row.csat_tecnico,
+                  nps: row.nps,
+                  mhs: row.mhs,
+                  pesquisa_geral_respondida: row.pesquisa_geral_respondida,
+                  results_focus: row.results_focus,
+                  social_profile: row.social_profile,
+                  espera_resultado_mensuravel: row.espera_resultado_mensuravel,
+                  mensura_resultado_financeiro: row.mensura_resultado_financeiro,
+                  cliente_apto_pesquisa: row.cliente_apto_pesquisa,
+                  last_updated_engagement: row.last_updated_engagement,
+                  last_updated_results: row.last_updated_results,
+                  last_updated_relationship: row.last_updated_relationship,
+                  last_updated_surveys: row.last_updated_surveys,
+                  lastUpdated: row.last_updated || row.updated_at
+              }));
+
+              setAllHealthInputs(allInputs);
+
+              const inputs: Record<string, HealthInput> = {};
+              // Since we ordered by month_key ascending, iterating through will overwrite with the latest
+              allInputs.forEach(input => {
+                  inputs[input.clientId] = input;
+              });
+              setHealthInputs(inputs);
+          }
+      } catch (err) {
+          console.error("Erro ao buscar health inputs:", err);
+      }
+  };
+
+  const saveHealthInput = async (input: HealthInput) => {
+      // Captura estado anterior ANTES de atualizar o estado local
+      const oldInput = healthInputs[input.clientId] || null;
+      const isNewRecord = !oldInput;
+
+      // Update local state immediately
+      setHealthInputs(prev => ({ ...prev, [input.clientId]: input }));
+
+      if (isOfflineMode) {
+          setStatusMsg("Avaliação salva localmente (Offline).");
+          setTimeout(() => setStatusMsg(null), 3000);
+          return;
+      }
+
+      try {
+          const payload = {
+              client_id: input.clientId,
+              month_key: input.monthKey,
+              checkin: input.checkin,
+              whatsapp: input.whatsapp,
+              adimplencia: input.adimplencia,
+              recarga: input.recarga,
+              roi_bucket: input.roi_bucket,
+              growth: input.growth,
+              engagement_vs_avg: input.engagement_vs_avg,
+              checkin_produtivo: input.checkin_produtivo,
+              progresso: input.progresso,
+              relacionamento_interno: input.relacionamento_interno,
+              aviso_previo: input.aviso_previo,
+              pesquisa_respondida: input.pesquisa_respondida,
+              csat_tecnico: input.csat_tecnico,
+              nps: input.nps,
+              mhs: input.mhs,
+              pesquisa_geral_respondida: input.pesquisa_geral_respondida,
+
+              // Metadata e qualificadores
+              results_focus: input.results_focus,
+              social_profile: input.social_profile,
+              espera_resultado_mensuravel: input.espera_resultado_mensuravel,
+              mensura_resultado_financeiro: input.mensura_resultado_financeiro,
+              cliente_apto_pesquisa: input.cliente_apto_pesquisa,
+              last_updated_engagement: input.last_updated_engagement,
+              last_updated_results: input.last_updated_results,
+              last_updated_relationship: input.last_updated_relationship,
+              last_updated_surveys: input.last_updated_surveys,
+              last_updated: input.lastUpdated,
+              updated_at: new Date().toISOString()
+          };
+
+          // === DEBUG LOGS (remover após diagnóstico) ===
+          console.log('[HS-SAVE] Iniciando save para:', input.clientId, '| mês:', input.monthKey);
+          console.log('[HS-SAVE] Usuário:', session?.email);
+
+          // Estratégia robusta: UPDATE primeiro → se não atualizou nenhuma linha, INSERT
+          const { data: updatedRows, error: updateError } = await supabase
+            .from('health_inputs')
+            .update(payload)
+            .eq('client_id', input.clientId)
+            .eq('month_key', input.monthKey)
+            .select();
+
+          console.log('[HS-SAVE] UPDATE result → rows:', updatedRows?.length ?? 'null', '| error:', updateError?.message ?? 'none');
+          if (updatedRows && updatedRows.length > 0) {
+              console.log('[HS-SAVE] Dados gravados no banco (amostra):', {
+                  client_id: updatedRows[0].client_id,
+                  month_key: updatedRows[0].month_key,
+                  checkin: updatedRows[0].checkin,
+                  aviso_previo: updatedRows[0].aviso_previo,
+                  nps: updatedRows[0].nps,
+                  updated_at: updatedRows[0].updated_at,
+              });
+          }
+
+          if (updateError) throw updateError;
+
+          if (!updatedRows || updatedRows.length === 0) {
+              console.log('[HS-SAVE] Nenhuma linha atualizada → tentando INSERT...');
+              const { data: insertedRows, error: insertError } = await supabase
+                .from('health_inputs')
+                .insert(payload)
+                .select();
+
+              console.log('[HS-SAVE] INSERT result → rows:', insertedRows?.length ?? 'null', '| error:', insertError?.message ?? 'none');
+              if (insertError) throw insertError;
+          }
+
+          // Verificação imediata: re-lê do banco para confirmar que o dado persistiu
+          const { data: verifyRows } = await supabase
+              .from('health_inputs')
+              .select('client_id, month_key, checkin, aviso_previo, nps, updated_at')
+              .eq('client_id', input.clientId)
+              .eq('month_key', input.monthKey);
+          console.log('[HS-VERIFY] Leitura imediata do banco após save:', verifyRows);
+
+          // Registro manual no histórico com autoria e diff old→new
+          const TRACKED_FIELDS = [
+              'checkin','whatsapp','adimplencia','recarga',
+              'roi_bucket','growth','engagement_vs_avg',
+              'checkin_produtivo','progresso','relacionamento_interno',
+              'aviso_previo','pesquisa_respondida',
+              'csat_tecnico','nps','mhs','pesquisa_geral_respondida',
+              'results_focus','social_profile',
+              'espera_resultado_mensuravel','mensura_resultado_financeiro','cliente_apto_pesquisa'
+          ];
+
+          const buildSnapshot = (src: HealthInput | null) => {
+              if (!src) return null;
+              return TRACKED_FIELDS.reduce((acc, f) => {
+                  acc[f] = (src as any)[f] ?? null;
+                  return acc;
+              }, {} as Record<string, any>);
+          };
+
+          const historyEntry = {
+              operation: isNewRecord ? 'INSERT' : 'UPDATE',
+              client_id: input.clientId,
+              month_key: input.monthKey,
+              changed_by: session?.email || 'desconhecido',
+              old_values: buildSnapshot(oldInput),
+              new_values: buildSnapshot(input),
+              changed_at: new Date().toISOString()
+          };
+
+          const { error: histErr } = await supabase
+              .from('health_score_history')
+              .insert(historyEntry);
+
+          if (histErr) console.warn("Aviso: histórico não registrado:", histErr.message);
+
+          // Atualiza allHealthInputs diretamente sem re-fetch completo.
+          // Isso evita que o fetchHealthInputs() sobrescreva o update otimista
+          // com dados potencialmente stale do banco (causa do "snap-back").
+          setAllHealthInputs(prev => {
+              const idx = prev.findIndex(
+                  i => i.clientId === input.clientId && i.monthKey === input.monthKey
+              );
+              if (idx >= 0) {
+                  const updated = [...prev];
+                  updated[idx] = input;
+                  return updated;
+              }
+              return [...prev, input];
+          });
+
+          // Re-assert o estado otimista (garante que healthInputs não seja
+          // sobrescrito por nenhum setState pendente de renders anteriores)
+          setHealthInputs(prev => ({ ...prev, [input.clientId]: input }));
+
+          // Busca apenas o histórico (não re-fetcha health_inputs para evitar snap-back)
+          await fetchHealthHistory();
+          setStatusMsg("Avaliação salva na nuvem!");
+      } catch (err: any) {
+          console.error("Erro ao salvar health input:", err);
+          setStatusMsg(`Erro ao salvar: ${err.message || 'Erro desconhecido'}`);
+      } finally {
+          setTimeout(() => setStatusMsg(null), 3000);
+      }
+  };
+
+  const fetchCloudData = async () => {
+      setIsSyncing(true);
+      try {
+          const { data, error } = await supabase
+            .from('app_state')
+            .select('*')
+            .limit(1)
+            .single();
+
+          if (error) {
+              if (error.code === 'PGRST116') {
+                  console.log("Banco de dados inicializado vazio.");
+                  setEntries([]);
+                  setEmployees([]);
+                  setClients([]);
+                  return;
+              }
+              throw error;
+          }
+
+          if (data) {
+              const appData = data.data || data;
+              const loadedEntries = (appData.entries || []).map((e: any) => ({
+                  ...e,
+                  date: new Date(e.date)
+              }));
+
+              setEntries(loadedEntries);
+              setEmployees(appData.employees || []);
+              setClients(appData.clients || []);
+
+              if (loadedEntries.length > 0 && !startDate) {
+                  const dates = loadedEntries.map((e: TimeEntry) => e.date.getTime());
+                  setStartDate(new Date(Math.min(...dates)).toISOString().split('T')[0]);
+                  setEndDate(new Date(Math.max(...dates)).toISOString().split('T')[0]);
+              }
+              
+              if (data.updated_at) {
+                  const date = new Date(data.updated_at);
+                  setLastSync(date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }));
+              }
+          }
+      } catch (err: any) {
+          console.error("Erro ao buscar dados:", err);
+          // Em offline real, não mostramos erro crítico, apenas fallback
+          setStatusMsg("Erro na conexão com a nuvem.");
+      } finally {
+          setIsSyncing(false);
+      }
+  };
+
+  const saveToCloud = async (
+      newEntries: TimeEntry[], 
+      newEmps: EmployeeConfig[], 
+      newClients: ClientConfig[]
+  ) => {
+      if (!session?.isMaster) return;
+
+      // Em modo offline/teste, simulamos o salvamento
+      if (isOfflineMode) {
+          setLastSync(new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }));
+          setStatusMsg("Ambiente de Teste: Dados atualizados localmente.");
+          setTimeout(() => setStatusMsg(null), 3000);
+          return;
+      }
+
+      setIsSyncing(true);
+      try {
+          const { error } = await supabase
+            .from('app_state')
+            .upsert({
+                user_email: 'global',
+                data: {
+                    entries: newEntries,
+                    employees: newEmps,
+                    clients: newClients
+                },
+                updated_at: new Date().toISOString()
+            }, {
+                onConflict: 'user_email'
+            });
+
+          if (error) throw error;
+          
+          setLastSync(new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }));
+          setStatusMsg("Dados sincronizados com a nuvem!");
+          setTimeout(() => setStatusMsg(null), 3000);
+
+      } catch (err: any) {
+          console.error("Erro ao salvar:", err);
+          setStatusMsg(`Erro ao salvar: ${err.message || 'Falha de conexão'}`);
+      } finally {
+          setIsSyncing(false);
+      }
+  };
+
+  const handleEkyteSync = async () => {
+      if (!session?.isMaster) return;
+
+      setIsSyncing(true);
+      try {
+          const result = await syncEkyteData({ startDate, endDate });
+
+          if (result.entries.length === 0) {
+              setStatusMsg("Nenhum apontamento encontrado na eKyte para o periodo.");
+              setTimeout(() => setStatusMsg(null), 4000);
+              return;
+          }
+
+          await importTimeEntries(result.entries);
+          setStartDate(result.startDate);
+          setEndDate(result.endDate);
+          setLastSync(new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }));
+          setStatusMsg(`eKyte sincronizado: ${result.entriesCount} apontamentos.`);
+          setTimeout(() => setStatusMsg(null), 4000);
+      } catch (err: any) {
+          console.error("Erro ao sincronizar eKyte:", err);
+          setStatusMsg(`Erro eKyte: ${err.message || 'Falha na sincronizacao'}`);
+          setTimeout(() => setStatusMsg(null), 5000);
+      } finally {
+          setIsSyncing(false);
+      }
+  };
+
+  const importTimeEntries = async (newEntries: TimeEntry[]) => {
+    if (newEntries.length === 0) {
+        return;
+    }
+
+    const newDates = newEntries.map(e => e.date.getTime());
+    const minNewDate = Math.min(...newDates);
+    const maxNewDate = Math.max(...newDates);
+
+    const nonOverlappingEntries = entries.filter(e => {
+        const t = e.date.getTime();
+        return t < minNewDate || t > maxNewDate;
+    });
+
+    const mergedEntries = [...nonOverlappingEntries, ...newEntries];
+    
+    const uniqueExecutors = Array.from(new Set(newEntries.map(e => e.executor)));
+    const uniqueWorkspaces = Array.from(new Set(newEntries.map(e => e.workspace)));
+
+    const existingEmpMap = new Map(employees.map(e => [e.name, e]));
+    const newEmps: EmployeeConfig[] = [];
+    uniqueExecutors.forEach(name => {
+         if (!existingEmpMap.has(name)) {
+             newEmps.push({
+                 name,
+                 department: 'Outros',
+                 defaultCost: 0,
+                 defaultHours: 160,
+                 history: {}
+             });
+         }
+    });
+    const updatedEmps = [...employees, ...newEmps];
+
+    const existingClientMap = new Map(clients.map(c => [c.name, c]));
+    const newClientsList: ClientConfig[] = [];
+    uniqueWorkspaces.forEach(name => {
+         if (!existingClientMap.has(name)) {
+            newClientsList.push({
+                name,
+                isActive: true,
+                category: 'Executar',
+                defaultFee: 0,
+                history: {}
+            });
+         }
+    });
+    const updatedClients = [...clients, ...newClientsList];
+
+    setEntries(mergedEntries);
+    setEmployees(updatedEmps);
+    setClients(updatedClients);
+
+    setStartDate(new Date(minNewDate).toISOString().split('T')[0]);
+    setEndDate(new Date(maxNewDate).toISOString().split('T')[0]);
+    
+    await saveToCloud(mergedEntries, updatedEmps, updatedClients);
+  };
+
+  // -- CSV Import Logic (Merge) --
+  const handleDataLoaded = (csvContent: string) => {
+    const newEntries = parseCSV(csvContent);
+    if (newEntries.length === 0) {
+        setStatusMsg("Nenhum dado encontrado no CSV.");
+        setTimeout(() => setStatusMsg(null), 3000);
+        return;
+    }
+
+    void importTimeEntries(newEntries);
+  };
+
+  // -- Backup Import Logic (Replace All) --
+  const handleBackupLoaded = (backup: SystemBackup) => {
+      const msg = isOfflineMode 
+        ? "Importar backup? (Modo Offline: dados não serão salvos na nuvem)" 
+        : "Atenção: Importar um backup substituirá TODOS os dados na nuvem. Deseja continuar?";
+
+      if (window.confirm(msg)) {
+          setEntries(backup.entries);
+          setEmployees(backup.employees);
+          setClients(backup.clients);
+          
+          if (backup.entries.length > 0) {
+            const dates = backup.entries.map((e: TimeEntry) => e.date.getTime());
+            setStartDate(new Date(Math.min(...dates)).toISOString().split('T')[0]);
+            setEndDate(new Date(Math.max(...dates)).toISOString().split('T')[0]);
+          }
+
+          saveToCloud(backup.entries, backup.employees, backup.clients);
+      }
+  };
+
+  const handleUpdateEmployees = (newEmps: EmployeeConfig[]) => {
+    setEmployees(newEmps);
+    saveToCloud(entries, newEmps, clients);
+  };
+
+  const handleUpdateClients = (newClients: ClientConfig[]) => {
+    setClients(newClients);
+    saveToCloud(entries, employees, newClients);
+  };
+
+  const filteredEntries = useMemo(() => {
+    if (!startDate || !endDate) return entries;
+    const start = new Date(startDate + 'T00:00:00');
+    const end = new Date(endDate + 'T23:59:59');
+    return entries.filter(e => e.date >= start && e.date <= end);
+  }, [entries, startDate, endDate]);
+
+  const summary = useMemo(() => {
+    return calculateSummary(filteredEntries, employees, clients, startDate, endDate);
+  }, [filteredEntries, employees, clients, startDate, endDate]);
+
+  if (!session?.isAuthenticated) {
+      return <Login onLogin={setSession} />;
+  }
+
+  // Module Selection Screen
+  if (currentModule === 'none') {
+    return (
+      <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-4 animate-fade-in">
+        <div className="max-w-4xl w-full space-y-8">
+          <div className="text-center">
+            <h1 className="text-3xl font-bold text-gray-900">Bem-vindo ao Sistema de Governança</h1>
+            <p className="mt-2 text-gray-600">Selecione o módulo que deseja acessar</p>
+          </div>
+          
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-8">
+            {/* Productivity Module Card */}
+            <button 
+              onClick={() => setCurrentModule('productivity')}
+              className="bg-white p-8 rounded-xl shadow-sm border border-gray-200 hover:shadow-md hover:border-blue-300 transition-all group text-left"
+            >
+              <div className="h-12 w-12 bg-blue-100 rounded-lg flex items-center justify-center mb-6 group-hover:bg-blue-600 transition-colors">
+                <BarChart2 className="text-blue-600 group-hover:text-white transition-colors" size={24} />
+              </div>
+              <h2 className="text-xl font-bold text-gray-900 mb-2">Produtividade & Ocupação</h2>
+              <p className="text-gray-500">
+                Análise de timesheet, ocupação produtiva, horas extras e gestão de alocação de equipe.
+              </p>
+            </button>
+
+            {/* Health Score Module Card */}
+            <button 
+              onClick={() => HEALTH_SCORE_AVAILABLE && setCurrentModule('health')}
+              disabled={!HEALTH_SCORE_AVAILABLE}
+              className="relative bg-white p-8 rounded-xl shadow-sm border border-gray-200 transition-all group text-left disabled:cursor-not-allowed disabled:opacity-75 overflow-hidden"
+            >
+              {!HEALTH_SCORE_AVAILABLE && (
+                <div className="absolute right-0 top-0 bg-gray-900 text-white text-xs font-bold uppercase tracking-wide px-4 py-1 rounded-bl-lg">
+                  Indisponivel
+                </div>
+              )}
+              <div className="h-12 w-12 bg-red-100 rounded-lg flex items-center justify-center mb-6 transition-colors">
+                <HeartPulse className="text-red-600 transition-colors" size={24} />
+              </div>
+              <h2 className="text-xl font-bold text-gray-900 mb-2">Health Score & Churn</h2>
+              <p className="text-gray-500">
+                Monitoramento de saúde da carteira, indicadores de risco, engajamento e NPS.
+              </p>
+            </button>
+          </div>
+          
+          <div className="text-center mt-8">
+             <button onClick={() => setSession(null)} className="text-gray-400 hover:text-red-600 transition-colors flex items-center gap-2 mx-auto">
+                <LogOut size={16} /> Sair
+             </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50 flex flex-col font-sans text-gray-900">
+      <header className="bg-white border-b border-gray-200 sticky top-0 z-10 shadow-sm">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="flex justify-between h-14 items-center">
+            
+            <div className="flex items-center gap-3 cursor-pointer" onClick={() => setCurrentModule('none')}>
+              <div className={`p-1.5 rounded-lg ${currentModule === 'productivity' ? 'bg-blue-600' : 'bg-red-600'}`}>
+                {currentModule === 'productivity' ? <BarChart2 className="text-white" size={18} /> : <HeartPulse className="text-white" size={18} />}
+              </div>
+              <h1 className="text-base font-bold text-gray-900 tracking-tight hidden sm:block border-l border-gray-300 pl-3 whitespace-nowrap">
+                {currentModule === 'productivity' ? 'Karsten & Co - Produtividade' : 'Karsten & Co - Health Score'}
+              </h1>
+            </div>
+            
+            <div className="flex items-center space-x-4">
+                {/* Status Indicator */}
+                <div 
+                    className={`flex items-center gap-1.5 text-xs mr-2 px-2 py-1 rounded border ${
+                        isOfflineMode 
+                        ? 'bg-orange-50 text-orange-700 border-orange-100' 
+                        : 'bg-gray-50 text-gray-500 border-gray-100'
+                    }`} 
+                    title={isOfflineMode ? "Modo Offline (Sem conexão com banco)" : "Conectado à Nuvem"}
+                >
+                    {isSyncing ? (
+                        <RefreshCw className="h-3 w-3 animate-spin text-blue-500" />
+                    ) : isOfflineMode ? (
+                        <CloudOff className="h-3 w-3 text-orange-500" />
+                    ) : (
+                        <Cloud className={`h-3 w-3 ${session.isMaster ? 'text-green-500' : 'text-blue-500'}`} />
+                    )}
+                    <span className="hidden lg:inline">
+                        {isSyncing ? 'Sincronizando...' : isOfflineMode ? 'Modo Offline' : lastSync ? `Sinc: ${lastSync}` : 'Conectado'}
+                    </span>
+                    {!session.isMaster && <span className="ml-1 text-[10px] bg-blue-100 text-blue-700 px-1 rounded">Leitor</span>}
+                </div>
+
+                {currentModule === 'productivity' && (entries.length > 0 || clients.length > 0) && (
+                    <>
+                        <div className="flex space-x-1 bg-gray-100 p-1 rounded-md">
+                            <button
+                                onClick={() => setActiveTab('dashboard')}
+                                className={`flex items-center gap-1 px-3 py-1 rounded text-sm font-medium transition-all ${
+                                    activeTab === 'dashboard' ? 'bg-white shadow-sm text-blue-700' : 'text-gray-500 hover:text-gray-700'
+                                }`}
+                            >
+                                <LayoutDashboard className="h-4 w-4" />
+                                <span className="hidden md:inline">Dashboard</span>
+                            </button>
+                            {session.isMaster && (
+                                <button
+                                    onClick={() => setActiveTab('settings')}
+                                    className={`flex items-center gap-1 px-3 py-1 rounded text-sm font-medium transition-all ${
+                                        activeTab === 'settings' ? 'bg-white shadow-sm text-blue-700' : 'text-gray-500 hover:text-gray-700'
+                                    }`}
+                                >
+                                    <SettingsIcon className="h-4 w-4" />
+                                    <span className="hidden md:inline">Configurações</span>
+                                </button>
+                            )}
+                        </div>
+                        <div className="hidden md:flex items-center gap-2 border-l pl-4 ml-2 border-gray-200">
+                             <input type="date" className={DATE_INPUT_STYLE} value={startDate} onChange={e => setStartDate(e.target.value)} />
+                             <span className="text-gray-400 text-xs">até</span>
+                             <input type="date" className={DATE_INPUT_STYLE} value={endDate} onChange={e => setEndDate(e.target.value)} />
+                            
+                             {session.isMaster && (
+                                 <div className="ml-2 flex items-center gap-2">
+                                    <EkyteSyncButton onSync={handleEkyteSync} disabled={isSyncing} compact />
+                                    <FileUpload onDataLoaded={handleDataLoaded} onBackupLoaded={handleBackupLoaded} />
+                                 </div>
+                             )}
+                        </div>
+                    </>
+                )}
+
+                <div className="border-l pl-4 ml-2 border-gray-200 flex items-center gap-3">
+                    <span className="text-xs text-gray-500 hidden lg:block">{session.email}</span>
+                    <button onClick={() => setSession(null)} className="text-gray-400 hover:text-red-600 transition-colors" title="Sair">
+                        <LogOut size={18} />
+                    </button>
+                </div>
+            </div>
+          </div>
+        </div>
+        {statusMsg && (
+            <div className={`text-white text-xs text-center py-1 absolute w-full top-14 left-0 animate-fade-in z-20 ${statusMsg.includes('Erro') ? 'bg-red-600' : statusMsg.includes('Offline') || statusMsg.includes('Teste') ? 'bg-orange-500' : 'bg-green-600'}`}>
+                {statusMsg}
+            </div>
+        )}
+      </header>
+
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
+        {currentModule === 'productivity' ? (
+             entries.length === 0 && clients.length === 0 ? (
+              <div className="flex flex-col items-center justify-center min-h-[50vh] animate-fade-in-up">
+                <div className="bg-white p-8 rounded-2xl shadow-sm border border-gray-100 text-center max-w-lg">
+                    <div className={`${isOfflineMode ? 'bg-orange-50' : 'bg-blue-50'} p-3 rounded-full w-16 h-16 flex items-center justify-center mx-auto mb-4`}>
+                        {isOfflineMode ? <CloudOff className="text-orange-500 h-8 w-8" /> : <Cloud className="text-blue-600 h-8 w-8" />}
+                    </div>
+                    <h2 className="text-2xl font-bold text-gray-900">
+                        {isOfflineMode ? 'Modo de Teste (Offline)' : 'Base de Dados na Nuvem'}
+                    </h2>
+                    
+                    {session.isMaster || isOfflineMode ? (
+                        <>
+                            <p className="mt-2 text-gray-500 mb-8 text-sm leading-relaxed">
+                                {isOfflineMode 
+                                 ? "Este ambiente não possui conexão com banco de dados. Importe seus dados para testar a interface localmente." 
+                                 : "O banco de dados está vazio ou não conectado. Importe uma planilha ou um backup para iniciar e sincronizar."}
+                            </p>
+                            <div className="flex flex-wrap justify-center gap-2">
+                                {!isOfflineMode && (
+                                  <EkyteSyncButton onSync={handleEkyteSync} disabled={isSyncing} />
+                                )}
+                                <FileUpload onDataLoaded={handleDataLoaded} onBackupLoaded={handleBackupLoaded} />
+                            </div>
+                        </>
+                    ) : (
+                        <>
+                            <p className="mt-2 text-gray-500 mb-6 text-sm leading-relaxed">
+                                Nenhum dado encontrado no servidor.<br/>
+                                Aguarde o administrador carregar a base de dados.
+                            </p>
+                            <button 
+                                onClick={fetchCloudData} 
+                                className="inline-flex items-center gap-2 text-blue-600 bg-blue-50 px-4 py-2 rounded-md hover:bg-blue-100 transition-colors"
+                            >
+                                <RefreshCw size={16} /> Tentar recarregar
+                            </button>
+                        </>
+                    )}
+                </div>
+              </div>
+            ) : (
+              activeTab === 'dashboard' ? (
+                <Dashboard summary={summary} /> 
+              ) : (
+                <Settings 
+                  employees={employees} 
+                  clients={clients} 
+                  onUpdateEmployees={handleUpdateEmployees} 
+                  onUpdateClients={handleUpdateClients} 
+                  canEdit={session.permissions?.canEditProductivity ?? session.isMaster}
+                />
+              )
+            )
+        ) : HEALTH_SCORE_AVAILABLE ? (
+            <HealthDashboard
+              clients={clients}
+              savedInputs={healthInputs}
+              allHealthInputs={allHealthInputs}
+              healthHistory={healthHistory}
+              onSaveInput={saveHealthInput}
+              canEdit={session.permissions?.canEditHealthScore ?? session.isMaster}
+            />
+        ) : (
+            <div className="flex flex-col items-center justify-center min-h-[50vh] animate-fade-in-up">
+              <div className="bg-white p-8 rounded-2xl shadow-sm border border-gray-100 text-center max-w-lg">
+                <div className="bg-gray-100 p-3 rounded-full w-16 h-16 flex items-center justify-center mx-auto mb-4">
+                  <HeartPulse className="text-gray-500 h-8 w-8" />
+                </div>
+                <div className="inline-flex items-center rounded-full bg-gray-900 px-3 py-1 text-xs font-bold uppercase tracking-wide text-white mb-4">
+                  Indisponivel
+                </div>
+                <h2 className="text-2xl font-bold text-gray-900">Health Score em configuracao</h2>
+                <p className="mt-2 text-gray-500 mb-6 text-sm leading-relaxed">
+                  Este modulo esta temporariamente indisponivel enquanto a base da V4 Karsten & Co e preparada.
+                </p>
+                <button
+                  onClick={() => setCurrentModule('none')}
+                  className="inline-flex items-center gap-2 text-gray-700 bg-gray-100 px-4 py-2 rounded-md hover:bg-gray-200 transition-colors"
+                >
+                  Voltar para modulos
+                </button>
+              </div>
+            </div>
+        )}
+      </main>
+    </div>
+  );
+};
+
+export default App;

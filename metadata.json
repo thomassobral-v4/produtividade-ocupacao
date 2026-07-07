@@ -1,0 +1,5 @@
+{
+  "name": "V4 Karsten & Co - Produtividade e Health Score",
+  "description": "A Business Intelligence tool to analyze agency productivity, profitability, and client health based on Ekyte timesheet CSV exports.",
+  "requestFramePermissions": []
+}

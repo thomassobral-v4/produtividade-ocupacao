@@ -1,0 +1,671 @@
+import React, { useState, useRef } from 'react';
+import { EmployeeConfig, ClientConfig, DepartmentType, ClientCategory, ClientCategory as Vertical } from '../types';
+import { Save, User, Briefcase, Plus, Archive, RefreshCw, Calendar, FileText, Loader, Upload, UserX } from 'lucide-react';
+import { extractContractData } from '../services/contractParser';
+
+interface SettingsProps {
+  employees: EmployeeConfig[];
+  clients: ClientConfig[];
+  onUpdateEmployees: (emps: EmployeeConfig[]) => void;
+  onUpdateClients: (clients: ClientConfig[]) => void;
+  canEdit?: boolean;
+}
+
+const DEPARTMENTS: DepartmentType[] = ['Criação', 'Atendimento', 'Gestão de Tráfego', 'Gestão', 'Outros'];
+const CATEGORIES: ClientCategory[] = ['Saber', 'Ter', 'Executar'];
+
+const generateMonthOptions = () => {
+    const options = [{ label: 'Padrão (Geral)', value: 'default' }];
+    const today = new Date();
+    for (let i = -6; i <= 6; i++) {
+        const d = new Date(today.getFullYear(), today.getMonth() + i, 1);
+        const val = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+        const label = d.toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' });
+        options.push({ label: label.charAt(0).toUpperCase() + label.slice(1), value: val });
+    }
+    return options;
+};
+
+const monthOptions = generateMonthOptions();
+const INPUT_STYLE = "bg-gray-700 text-white border-gray-600 rounded-md shadow-sm focus:ring-red-500 focus:border-red-500 block w-full sm:text-sm p-1.5 border";
+
+const Settings: React.FC<SettingsProps> = ({ employees, clients, onUpdateEmployees, onUpdateClients, canEdit = true }) => {
+  const [activeTab, setActiveTab] = useState<'employees' | 'clients'>('employees');
+  const [selectedMonth, setSelectedMonth] = useState<string>('default');
+
+  const [localEmps, setLocalEmps] = useState(employees);
+  const [localClients, setLocalClients] = useState(clients);
+  const [isSaved, setIsSaved] = useState(false);
+
+  // Churn flow
+  const [showInactive, setShowInactive] = useState(false);
+  const [churnTarget, setChurnTarget] = useState<number | null>(null); // index being churned
+  const [churnDate, setChurnDate] = useState<string>(new Date().toISOString().slice(0, 10));
+
+  const isChurned = (emp: EmployeeConfig): boolean => {
+    if (!emp.endDate) return false;
+    return new Date(emp.endDate + 'T00:00:00') <= new Date();
+  };
+
+  const handleChurnConfirm = (idx: number) => {
+    const newEmps = [...localEmps];
+    newEmps[idx] = { ...newEmps[idx], endDate: churnDate };
+    setLocalEmps(newEmps);
+    setChurnTarget(null);
+    setIsSaved(false);
+  };
+
+  const handleReativar = (idx: number) => {
+    const newEmps = [...localEmps];
+    newEmps[idx] = { ...newEmps[idx], endDate: '' };
+    setLocalEmps(newEmps);
+    setIsSaved(false);
+  };
+
+  // Loading state for PDF parsing
+  const [processingClientIndex, setProcessingClientIndex] = useState<number | null>(null);
+
+  const [newClientName, setNewClientName] = useState('');
+  const [newClientFee, setNewClientFee] = useState('');
+  const [newClientCategory, setNewClientCategory] = useState<ClientCategory>('Executar');
+  
+  // Ref for hidden file input used for contract uploads
+  const fileInputRefs = useRef<{[key: number]: HTMLInputElement | null}>({});
+
+  if (!canEdit) {
+    return (
+      <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-8 text-center">
+        <UserX className="mx-auto h-12 w-12 text-gray-400 mb-4" />
+        <h3 className="text-lg font-medium text-gray-900">Acesso Restrito</h3>
+        <p className="text-gray-500 mt-2">Você não tem permissão para editar as configurações de produtividade.</p>
+      </div>
+    );
+  }
+
+  const handleEmpVerticalToggle = (index: number, vertical: Vertical) => {
+    const newEmps = [...localEmps];
+    const emp = newEmps[index];
+    const current: Vertical[] = emp.verticals || ['Executar'];
+    const hasVertical = current.includes(vertical);
+    if (hasVertical && current.length === 1) return; // mínimo 1 vertical
+    if (hasVertical) {
+        emp.verticals = current.filter(v => v !== vertical);
+        // Remove as horas configuradas para a vertical removida
+        if (emp.verticalHours) delete emp.verticalHours[vertical];
+    } else {
+        emp.verticals = [...current, vertical];
+    }
+    setLocalEmps(newEmps);
+    setIsSaved(false);
+  };
+
+  const handleEmpVerticalHours = (index: number, vertical: Vertical, value: string) => {
+    const newEmps = [...localEmps];
+    const emp = newEmps[index];
+    if (!emp.verticalHours) emp.verticalHours = {};
+    const parsed = parseFloat(value);
+    emp.verticalHours[vertical] = isNaN(parsed) || parsed < 0 ? 0 : parsed;
+    setLocalEmps(newEmps);
+    setIsSaved(false);
+  };
+
+  const handleEmpChange = (index: number, field: string, value: string) => {
+    const newEmps = [...localEmps];
+    const emp = newEmps[index];
+
+    if (field === 'department' || field === 'name' || field === 'startDate' || field === 'endDate') {
+        // @ts-ignore
+        emp[field] = value;
+    } else {
+        const numValue = parseFloat(value) || 0;
+        
+        if (selectedMonth === 'default') {
+            if (field === 'monthlyCost') emp.defaultCost = numValue;
+            if (field === 'monthlyHours') emp.defaultHours = numValue;
+        } else {
+            if (!emp.history) emp.history = {};
+            if (!emp.history[selectedMonth]) {
+                emp.history[selectedMonth] = { cost: emp.defaultCost, hours: emp.defaultHours };
+            }
+            if (field === 'monthlyCost') emp.history[selectedMonth].cost = numValue;
+            if (field === 'monthlyHours') emp.history[selectedMonth].hours = numValue;
+        }
+    }
+    setLocalEmps(newEmps);
+    setIsSaved(false);
+  };
+
+  const handleClientChange = (index: number, field: string, value: any) => {
+    const newClients = [...localClients];
+    const client = newClients[index];
+
+    if (field === 'monthlyFee') {
+        const numValue = parseFloat(value) || 0;
+        if (selectedMonth === 'default') {
+            client.defaultFee = numValue;
+        } else {
+            if (!client.history) client.history = {};
+            client.history[selectedMonth] = numValue;
+        }
+    } else if (field === 'oneTimeFee') {
+         client.oneTimeFee = parseFloat(value) || 0;
+    } else {
+        // @ts-ignore
+        client[field] = value;
+    }
+    setLocalClients(newClients);
+    setIsSaved(false);
+  };
+
+  const handleAddClient = () => {
+      if (!newClientName) return;
+      const fee = parseFloat(newClientFee) || 0;
+      const newClient: ClientConfig = {
+          name: newClientName,
+          isActive: true,
+          category: newClientCategory,
+          defaultFee: selectedMonth === 'default' ? fee : 0,
+          history: selectedMonth !== 'default' ? { [selectedMonth]: fee } : {}
+      };
+      setLocalClients([...localClients, newClient]);
+      setNewClientName('');
+      setNewClientFee('');
+      setIsSaved(false);
+  };
+
+  const handleSave = () => {
+    onUpdateEmployees(localEmps);
+    onUpdateClients(localClients);
+    setIsSaved(true);
+    setTimeout(() => setIsSaved(false), 3000);
+  };
+
+  const handleContractUpload = async (e: React.ChangeEvent<HTMLInputElement>, index: number) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+
+      setProcessingClientIndex(index);
+      try {
+          const data = await extractContractData(file);
+          
+          const newClients = [...localClients];
+          const client = newClients[index];
+
+          if (data.recurringFee > 0) {
+              if (selectedMonth === 'default') {
+                  client.defaultFee = data.recurringFee;
+              } else {
+                  if (!client.history) client.history = {};
+                  client.history[selectedMonth] = data.recurringFee;
+              }
+          }
+
+          if (data.oneTimeFee > 0) {
+              client.oneTimeFee = data.oneTimeFee;
+          }
+
+          if (data.startDate) {
+              client.contractStartDate = data.startDate;
+          }
+          
+          if (!client.name && data.clientName) {
+              client.name = data.clientName;
+          }
+
+          setLocalClients(newClients);
+          setIsSaved(false);
+          alert(`Contrato Processado!\nFee Recorrente: R$ ${data.recurringFee}\nSetup (One-Time): R$ ${data.oneTimeFee}\nInício: ${data.startDate || 'Não detectado'}`);
+
+      } catch (err: any) {
+          console.error("PDF Error:", err);
+          // Mensagem de erro mais detalhada para facilitar debug
+          alert(`Erro ao ler o PDF: ${err.message || err}`);
+      } finally {
+          setProcessingClientIndex(null);
+          // Clear input
+          if (e.target) e.target.value = '';
+      }
+  };
+
+  const getEmpValue = (emp: EmployeeConfig, type: 'cost' | 'hours') => {
+      if (selectedMonth === 'default') {
+          return type === 'cost' ? emp.defaultCost : emp.defaultHours;
+      }
+      const hist = emp.history && emp.history[selectedMonth];
+      return hist ? (type === 'cost' ? hist.cost : hist.hours) : (type === 'cost' ? emp.defaultCost : emp.defaultHours);
+  };
+
+  const getClientFee = (client: ClientConfig) => {
+      if (selectedMonth === 'default') return client.defaultFee;
+      return client.history && client.history[selectedMonth] !== undefined ? client.history[selectedMonth] : client.defaultFee;
+  };
+
+  const sortedClients = [...localClients].sort((a, b) => {
+      if (a.isActive === b.isActive) return a.name.localeCompare(b.name);
+      return a.isActive ? -1 : 1;
+  });
+
+  return (
+    <div className="bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden">
+      <div className="border-b border-gray-200 flex flex-col md:flex-row justify-between items-center bg-gray-50 px-6 py-4 gap-4">
+        <div className="flex space-x-4">
+          <button
+            onClick={() => setActiveTab('employees')}
+            className={`flex items-center space-x-2 px-3 py-2 rounded-md text-sm font-medium transition-colors ${
+              activeTab === 'employees' ? 'bg-white text-red-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+            }`}
+          >
+            <User size={16} />
+            <span>Colaboradores</span>
+          </button>
+          <button
+            onClick={() => setActiveTab('clients')}
+            className={`flex items-center space-x-2 px-3 py-2 rounded-md text-sm font-medium transition-colors ${
+              activeTab === 'clients' ? 'bg-white text-red-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+            }`}
+          >
+            <Briefcase size={16} />
+            <span>Clientes</span>
+          </button>
+        </div>
+
+        <div className="flex items-center space-x-2 bg-white px-3 py-1.5 rounded-md border border-gray-300">
+            <Calendar size={16} className="text-gray-500" />
+            <span className="text-xs font-medium text-gray-500">Mês de Competência:</span>
+            <select 
+                value={selectedMonth} 
+                onChange={(e) => setSelectedMonth(e.target.value)}
+                className="text-sm border-none focus:ring-0 text-gray-700 font-medium bg-transparent cursor-pointer"
+            >
+                {monthOptions.map(opt => (
+                    <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+            </select>
+        </div>
+
+        <button
+          onClick={handleSave}
+          className="flex items-center space-x-2 bg-red-700 hover:bg-red-800 text-white px-4 py-2 rounded-md text-sm transition-colors"
+        >
+          <Save size={16} />
+          <span>{isSaved ? 'Salvo!' : 'Salvar Alterações'}</span>
+        </button>
+      </div>
+
+      <div className="p-6">
+        {selectedMonth !== 'default' && (
+            <div className="bg-yellow-50 border-l-4 border-yellow-400 p-3 mb-6">
+                <p className="text-sm text-yellow-700">
+                    <strong>Atenção:</strong> Você está editando valores específicos para <strong>{monthOptions.find(o => o.value === selectedMonth)?.label}</strong>. 
+                </p>
+            </div>
+        )}
+
+        {activeTab === 'employees' ? (
+          <div className="overflow-x-auto">
+            {/* Filtro: ativos / todos */}
+            <div className="flex items-center justify-between px-2 pb-3">
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-gray-500 font-medium">
+                  {localEmps.filter(e => !isChurned(e)).length} ativo(s)
+                  {localEmps.filter(e => isChurned(e)).length > 0 && (
+                    <> · <span className="text-red-500">{localEmps.filter(e => isChurned(e)).length} desligado(s)</span></>
+                  )}
+                </span>
+              </div>
+              {localEmps.some(e => isChurned(e)) && (
+                <button
+                  onClick={() => setShowInactive(v => !v)}
+                  className={`text-xs px-2 py-1 rounded border transition-colors ${showInactive ? 'bg-gray-700 text-white border-gray-700' : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50'}`}
+                >
+                  {showInactive ? 'Ocultar desligados' : 'Mostrar desligados'}
+                </button>
+              )}
+            </div>
+            <table className="min-w-full divide-y divide-gray-200">
+              <thead>
+                <tr>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Nome</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Departamento</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Verticais</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Início</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Saída</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Custo Mensal {selectedMonth !== 'default' && '(Exceção)'}
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Capacidade (Auto)
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Ação</th>
+                </tr>
+              </thead>
+              <tbody className="bg-white divide-y divide-gray-200">
+                {localEmps.map((emp, idx) => {
+                  const churned = isChurned(emp);
+                  if (churned && !showInactive) return null;
+                  return (
+                  <tr key={idx} className={churned ? 'bg-gray-50 opacity-70' : ''}>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                      <div className="flex flex-col gap-1">
+                        <span>{emp.name}</span>
+                        {churned && emp.endDate && (
+                          <span className="text-[10px] bg-gray-200 text-gray-600 px-1.5 py-0.5 rounded w-fit font-medium">
+                            Saiu em {new Date(emp.endDate + 'T00:00:00').toLocaleDateString('pt-BR')}
+                          </span>
+                        )}
+                      </div>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                        <select
+                            className={INPUT_STYLE}
+                            value={emp.department || 'Outros'}
+                            onChange={(e) => handleEmpChange(idx, 'department', e.target.value)}
+                        >
+                            {DEPARTMENTS.map(d => <option key={d} value={d}>{d}</option>)}
+                        </select>
+                    </td>
+                    <td className="px-4 py-3" style={{minWidth: '220px'}}>
+                      {/* Por vertical ativa: badge toggle + input de horas mensais */}
+                      <div className="space-y-1.5">
+                        {(['Executar', 'Saber', 'Ter'] as Vertical[]).map(v => {
+                          const active = (emp.verticals || ['Executar']).includes(v);
+                          const vh = emp.verticalHours?.[v] ?? '';
+                          const palette = {
+                            Executar: { on: 'bg-red-600 text-white', off: 'bg-gray-100 text-gray-400', ring: 'focus:ring-red-400', border: 'border-red-200' },
+                            Saber:    { on: 'bg-yellow-500 text-white', off: 'bg-gray-100 text-gray-400', ring: 'focus:ring-yellow-400', border: 'border-yellow-200' },
+                            Ter:      { on: 'bg-green-600 text-white', off: 'bg-gray-100 text-gray-400', ring: 'focus:ring-green-400', border: 'border-green-200' },
+                          }[v];
+                          return (
+                            <div key={v} className="flex items-center gap-2">
+                              {/* Toggle */}
+                              <button
+                                onClick={() => handleEmpVerticalToggle(idx, v)}
+                                className={`w-16 text-[10px] font-bold py-0.5 rounded border transition-colors ${active ? palette.on + ' border-transparent' : palette.off + ' border-gray-200 hover:bg-gray-200'}`}
+                                title={active ? `Remover ${v}` : `Adicionar ${v}`}
+                              >{v}</button>
+                              {/* Input de horas — só aparece quando a vertical está ativa */}
+                              {active && (
+                                <div className="flex items-center gap-1">
+                                  <input
+                                    type="number"
+                                    min="0"
+                                    step="0.5"
+                                    placeholder="8"
+                                    value={vh}
+                                    onChange={e => handleEmpVerticalHours(idx, v, e.target.value)}
+                                    className={`w-14 text-xs text-center border rounded px-1 py-0.5 bg-white focus:outline-none focus:ring-1 ${palette.ring} ${palette.border}`}
+                                  />
+                                  <span className="text-[10px] text-gray-400">h/dia útil</span>
+                                </div>
+                              )}
+                              {active && !vh && (
+                                <span className="text-[9px] text-gray-400 italic">padrão 8h</span>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                        <input
+                            type="date"
+                            className={INPUT_STYLE}
+                            value={emp.startDate || ''}
+                            onChange={(e) => handleEmpChange(idx, 'startDate', e.target.value)}
+                        />
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      {churned && emp.endDate
+                        ? <span className="text-xs text-gray-500">{new Date(emp.endDate + 'T00:00:00').toLocaleDateString('pt-BR')}</span>
+                        : <input
+                            type="date"
+                            className={INPUT_STYLE}
+                            value={emp.endDate || ''}
+                            onChange={(e) => handleEmpChange(idx, 'endDate', e.target.value)}
+                          />
+                      }
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      <input
+                        type="number"
+                        className={INPUT_STYLE}
+                        value={getEmpValue(emp, 'cost')}
+                        onChange={(e) => handleEmpChange(idx, 'monthlyCost', e.target.value)}
+                      />
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-400 italic">
+                      8h/dia úteis
+                    </td>
+                    {/* Ação: Dar Saída / Reativar */}
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      {churned ? (
+                        <button
+                          onClick={() => handleReativar(idx)}
+                          className="text-xs px-2 py-1 rounded border border-green-300 text-green-700 bg-green-50 hover:bg-green-100 transition-colors"
+                        >
+                          Reativar
+                        </button>
+                      ) : churnTarget === idx ? (
+                        <div className="flex items-center gap-1 bg-red-50 border border-red-200 rounded p-2">
+                          <input
+                            type="date"
+                            className="text-xs border border-red-300 rounded px-1 py-0.5 bg-white focus:outline-none"
+                            value={churnDate}
+                            onChange={e => setChurnDate(e.target.value)}
+                          />
+                          <button
+                            onClick={() => handleChurnConfirm(idx)}
+                            className="text-xs px-2 py-0.5 rounded bg-red-600 text-white hover:bg-red-700"
+                          >
+                            Confirmar
+                          </button>
+                          <button
+                            onClick={() => setChurnTarget(null)}
+                            className="text-xs px-1.5 py-0.5 rounded border border-gray-300 text-gray-500 hover:bg-gray-100"
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          onClick={() => { setChurnTarget(idx); setChurnDate(new Date().toISOString().slice(0, 10)); }}
+                          className="text-xs px-2 py-1 rounded border border-red-200 text-red-600 bg-red-50 hover:bg-red-100 transition-colors flex items-center gap-1"
+                        >
+                          <UserX size={12} /> Dar Saída
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="space-y-6">
+             <div className="bg-gray-50 p-4 rounded-md border border-gray-200 flex flex-wrap items-end gap-4">
+                <div className="flex-1 min-w-[200px]">
+                    <label className="block text-xs font-medium text-gray-500 mb-1">Nome do Cliente/Projeto</label>
+                    <input 
+                        type="text" 
+                        className={INPUT_STYLE}
+                        placeholder="Nome do Cliente"
+                        value={newClientName}
+                        onChange={e => setNewClientName(e.target.value)}
+                    />
+                </div>
+                <div className="w-32">
+                    <label className="block text-xs font-medium text-gray-500 mb-1">Categoria</label>
+                    <select 
+                        className={INPUT_STYLE}
+                        value={newClientCategory}
+                        onChange={e => setNewClientCategory(e.target.value as ClientCategory)}
+                    >
+                        {CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+                    </select>
+                </div>
+                <div className="w-40">
+                    <label className="block text-xs font-medium text-gray-500 mb-1">Fee {selectedMonth !== 'default' ? 'Mês' : 'Padrão'}</label>
+                    <input 
+                        type="number" 
+                        className={INPUT_STYLE}
+                        placeholder="0.00"
+                        value={newClientFee}
+                        onChange={e => setNewClientFee(e.target.value)}
+                    />
+                </div>
+                <div className="w-40">
+                    <label className="block text-xs font-medium text-gray-500 mb-1">Account Manager</label>
+                    <select 
+                        className={INPUT_STYLE}
+                        value={(localClients.find(c => c.name === newClientName)?.accountManager) || ''}
+                        onChange={e => {
+                            // This is tricky because we are adding a new client. 
+                            // We need a state for newClientAccountManager.
+                            // But for now let's just add it to the table row editing.
+                        }}
+                        disabled
+                    >
+                        <option value="">(Adicionar na tabela)</option>
+                    </select>
+                </div>
+                <button 
+                    onClick={handleAddClient}
+                    disabled={!newClientName}
+                    className="bg-green-600 text-white px-4 py-2 rounded-md text-sm hover:bg-green-700 disabled:opacity-50 flex items-center gap-1 h-9"
+                >
+                    <Plus size={16} /> Adicionar
+                </button>
+             </div>
+
+             <div className="overflow-x-auto">
+                <table className="min-w-full divide-y divide-gray-200">
+                <thead>
+                    <tr>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-10">Contrato</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Início</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Nome</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Categoria</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Account</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        Fee Recorrente {selectedMonth !== 'default' && '(Mês)'}
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        Setup (One-Time)
+                    </th>
+                    <th className="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        Inadimplente
+                    </th>
+                    </tr>
+                </thead>
+                <tbody className="bg-white divide-y divide-gray-200">
+                    {sortedClients.map((client, idx) => {
+                        const realIndex = localClients.findIndex(c => c.name === client.name);
+                        return (
+                        <tr key={realIndex} className={client.isActive ? '' : 'bg-gray-50 opacity-75'}>
+                             <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                <button
+                                    onClick={() => fileInputRefs.current[realIndex]?.click()}
+                                    className="text-red-600 hover:text-red-800 transition-colors p-1 rounded hover:bg-red-50"
+                                    title="Carregar PDF do Contrato"
+                                    disabled={processingClientIndex === realIndex}
+                                >
+                                    {processingClientIndex === realIndex ? (
+                                        <Loader size={18} className="animate-spin" />
+                                    ) : (
+                                        <FileText size={18} />
+                                    )}
+                                </button>
+                                <input 
+                                    type="file" 
+                                    className="hidden" 
+                                    accept="application/pdf"
+                                    ref={el => fileInputRefs.current[realIndex] = el}
+                                    onChange={(e) => handleContractUpload(e, realIndex)}
+                                />
+                            </td>
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                <input
+                                    type="date"
+                                    className={INPUT_STYLE}
+                                    value={client.contractStartDate || ''}
+                                    onChange={(e) => handleClientChange(realIndex, 'contractStartDate', e.target.value)}
+                                />
+                            </td>
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                <select
+                                    value={client.isActive ? 'true' : 'false'}
+                                    onChange={(e) => handleClientChange(realIndex, 'isActive', e.target.value === 'true')}
+                                    className={`block w-full pl-2 pr-8 py-1 text-xs font-medium border-gray-300 focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm rounded-md ${client.isActive ? 'text-green-800 bg-green-50 border-green-200' : 'text-red-800 bg-red-50 border-red-200'}`}
+                                >
+                                    <option value="true">Ativo</option>
+                                    <option value="false">Churned</option>
+                                </select>
+                            </td>
+                            <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{client.name}</td>
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                <select 
+                                    className={INPUT_STYLE}
+                                    value={client.category || 'Executar'}
+                                    onChange={(e) => handleClientChange(realIndex, 'category', e.target.value)}
+                                >
+                                    {CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+                                </select>
+                            </td>
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                <select 
+                                    className={INPUT_STYLE}
+                                    value={client.accountManager || ''}
+                                    onChange={(e) => handleClientChange(realIndex, 'accountManager', e.target.value)}
+                                >
+                                    <option value="">Selecione...</option>
+                                    {localEmps.map(emp => (
+                                        <option key={emp.name} value={emp.name}>{emp.name}</option>
+                                    ))}
+                                </select>
+                            </td>
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                <input
+                                    type="number"
+                                    className={INPUT_STYLE}
+                                    value={getClientFee(client)}
+                                    onChange={(e) => handleClientChange(realIndex, 'monthlyFee', e.target.value)}
+                                />
+                            </td>
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                <input
+                                    type="number"
+                                    className={INPUT_STYLE}
+                                    value={client.oneTimeFee || 0}
+                                    onChange={(e) => handleClientChange(realIndex, 'oneTimeFee', e.target.value)}
+                                    placeholder="0.00"
+                                />
+                            </td>
+                            <td className="px-6 py-4 whitespace-nowrap text-center">
+                                {/* Receita excluída do lucro real quando marcado */}
+                                <button
+                                    onClick={() => handleClientChange(realIndex, 'is_inadimplente', !client.is_inadimplente)}
+                                    title={client.is_inadimplente ? 'Inadimplente: receita excluída do lucro' : 'Adimplente'}
+                                    className={`px-2 py-1 rounded text-xs font-semibold border transition-colors ${
+                                        client.is_inadimplente
+                                            ? 'bg-red-100 text-red-700 border-red-300 hover:bg-red-200'
+                                            : 'bg-green-50 text-green-700 border-green-200 hover:bg-green-100'
+                                    }`}
+                                >
+                                    {client.is_inadimplente ? 'Inadimplente' : 'Adimplente'}
+                                </button>
+                            </td>
+                        </tr>
+                    )})}
+                </tbody>
+                </table>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default Settings;
