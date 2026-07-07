@@ -10,13 +10,34 @@ import HealthDashboard from './components/HealthDashboard';
 import { LayoutDashboard, Settings as SettingsIcon, LogOut, RefreshCw, Cloud, CloudOff, Info, HeartPulse, BarChart2 } from 'lucide-react';
 import { supabase } from './lib/supabase';
 import { syncEkyteData } from './services/ekyteSync';
+import type { User } from '@supabase/supabase-js';
 
 const DATE_INPUT_STYLE = "bg-gray-700 text-white border-gray-600 rounded-md shadow-sm focus:ring-red-500 focus:border-red-500 sm:text-sm p-1 border";
 const HEALTH_SCORE_AVAILABLE = false;
+const ADMIN_EMAILS = new Set(['bianca.segato@v4company.com']);
+
+const buildUserSession = (user: User): UserSession | null => {
+  const email = user.email?.trim().toLowerCase();
+  if (!email || !email.endsWith('@v4company.com')) return null;
+
+  const appRole = String(user.app_metadata?.role || '').toLowerCase();
+  const isMaster = appRole === 'admin' || ADMIN_EMAILS.has(email);
+
+  return {
+    email,
+    isMaster,
+    isAuthenticated: true,
+    permissions: {
+      canEditHealthScore: isMaster,
+      canEditProductivity: isMaster
+    }
+  };
+};
 
 const App: React.FC = () => {
   // Auth State
   const [session, setSession] = useState<UserSession | null>(null);
+  const [isAuthLoading, setIsAuthLoading] = useState(true);
 
   // App State
   const [entries, setEntries] = useState<TimeEntry[]>([]);
@@ -41,11 +62,32 @@ const App: React.FC = () => {
   // @ts-ignore
   const isOfflineMode = !supabase.supabaseUrl || supabase.supabaseUrl.includes('placeholder');
 
+  useEffect(() => {
+    let mounted = true;
+
+    supabase.auth.getSession().then(({ data }) => {
+      if (!mounted) return;
+      const authUser = data.session?.user;
+      setSession(authUser ? buildUserSession(authUser) : null);
+      setIsAuthLoading(false);
+    });
+
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, authSession) => {
+      const authUser = authSession?.user;
+      setSession(authUser ? buildUserSession(authUser) : null);
+      setIsAuthLoading(false);
+    });
+
+    return () => {
+      mounted = false;
+      listener.subscription.unsubscribe();
+    };
+  }, []);
+
   // Initial Load from Cloud
   useEffect(() => {
     if (session?.isAuthenticated) {
         if (isOfflineMode) {
-            console.log("App em Modo Offline: Pulando busca inicial de dados.");
             return;
         }
         fetchCloudData();
@@ -73,12 +115,6 @@ const App: React.FC = () => {
           const { data, error } = await supabase.from('health_inputs').select('*').order('month_key', { ascending: true });
           if (error) throw error;
           if (data) {
-              console.log('[HS-FETCH] Total linhas recebidas do banco:', data.length);
-              // Log de clientes com múltiplas entradas (possível causa de conflito)
-              const counts: Record<string, number> = {};
-              data.forEach((r: any) => { counts[r.client_id] = (counts[r.client_id] || 0) + 1; });
-              const duplicates = Object.entries(counts).filter(([, c]) => c > 1);
-              if (duplicates.length > 0) console.warn('[HS-FETCH] ⚠️ Clientes com múltiplas linhas:', duplicates);
               const allInputs: HealthInput[] = data.map((row: any) => ({
                   clientId: row.client_id,
                   monthKey: row.month_key,
@@ -173,10 +209,6 @@ const App: React.FC = () => {
               updated_at: new Date().toISOString()
           };
 
-          // === DEBUG LOGS (remover após diagnóstico) ===
-          console.log('[HS-SAVE] Iniciando save para:', input.clientId, '| mês:', input.monthKey);
-          console.log('[HS-SAVE] Usuário:', session?.email);
-
           // Estratégia robusta: UPDATE primeiro → se não atualizou nenhuma linha, INSERT
           const { data: updatedRows, error: updateError } = await supabase
             .from('health_inputs')
@@ -185,38 +217,18 @@ const App: React.FC = () => {
             .eq('month_key', input.monthKey)
             .select();
 
-          console.log('[HS-SAVE] UPDATE result → rows:', updatedRows?.length ?? 'null', '| error:', updateError?.message ?? 'none');
-          if (updatedRows && updatedRows.length > 0) {
-              console.log('[HS-SAVE] Dados gravados no banco (amostra):', {
-                  client_id: updatedRows[0].client_id,
-                  month_key: updatedRows[0].month_key,
-                  checkin: updatedRows[0].checkin,
-                  aviso_previo: updatedRows[0].aviso_previo,
-                  nps: updatedRows[0].nps,
-                  updated_at: updatedRows[0].updated_at,
-              });
-          }
 
           if (updateError) throw updateError;
 
           if (!updatedRows || updatedRows.length === 0) {
-              console.log('[HS-SAVE] Nenhuma linha atualizada → tentando INSERT...');
-              const { data: insertedRows, error: insertError } = await supabase
+              const { error: insertError } = await supabase
                 .from('health_inputs')
                 .insert(payload)
                 .select();
 
-              console.log('[HS-SAVE] INSERT result → rows:', insertedRows?.length ?? 'null', '| error:', insertError?.message ?? 'none');
               if (insertError) throw insertError;
           }
 
-          // Verificação imediata: re-lê do banco para confirmar que o dado persistiu
-          const { data: verifyRows } = await supabase
-              .from('health_inputs')
-              .select('client_id, month_key, checkin, aviso_previo, nps, updated_at')
-              .eq('client_id', input.clientId)
-              .eq('month_key', input.monthKey);
-          console.log('[HS-VERIFY] Leitura imediata do banco após save:', verifyRows);
 
           // Registro manual no histórico com autoria e diff old→new
           const TRACKED_FIELDS = [
@@ -251,7 +263,6 @@ const App: React.FC = () => {
               .from('health_score_history')
               .insert(historyEntry);
 
-          if (histErr) console.warn("Aviso: histórico não registrado:", histErr.message);
 
           // Atualiza allHealthInputs diretamente sem re-fetch completo.
           // Isso evita que o fetchHealthInputs() sobrescreva o update otimista
@@ -294,7 +305,6 @@ const App: React.FC = () => {
 
           if (error) {
               if (error.code === 'PGRST116') {
-                  console.log("Banco de dados inicializado vazio.");
                   setEntries([]);
                   setEmployees([]);
                   setClients([]);
@@ -520,8 +530,22 @@ const App: React.FC = () => {
     return calculateSummary(filteredEntries, employees, clients, startDate, endDate);
   }, [filteredEntries, employees, clients, startDate, endDate]);
 
+  const handleLogout = async () => {
+      await supabase.auth.signOut();
+      setSession(null);
+      setCurrentModule('none');
+  };
+
+  if (isAuthLoading) {
+      return (
+          <div className="min-h-screen flex items-center justify-center bg-gray-50 text-gray-500">
+              Carregando...
+          </div>
+      );
+  }
+
   if (!session?.isAuthenticated) {
-      return <Login onLogin={setSession} />;
+      return <Login />;
   }
 
   // Module Selection Screen
@@ -571,7 +595,7 @@ const App: React.FC = () => {
           </div>
           
           <div className="text-center mt-8">
-             <button onClick={() => setSession(null)} className="text-gray-400 hover:text-red-600 transition-colors flex items-center gap-2 mx-auto">
+             <button onClick={handleLogout} className="text-gray-400 hover:text-red-600 transition-colors flex items-center gap-2 mx-auto">
                 <LogOut size={16} /> Sair
              </button>
           </div>
@@ -659,7 +683,7 @@ const App: React.FC = () => {
 
                 <div className="border-l pl-4 ml-2 border-gray-200 flex items-center gap-3">
                     <span className="text-xs text-gray-500 hidden lg:block">{session.email}</span>
-                    <button onClick={() => setSession(null)} className="text-gray-400 hover:text-red-600 transition-colors" title="Sair">
+                    <button onClick={handleLogout} className="text-gray-400 hover:text-red-600 transition-colors" title="Sair">
                         <LogOut size={18} />
                     </button>
                 </div>
@@ -765,3 +789,4 @@ const App: React.FC = () => {
 };
 
 export default App;
+

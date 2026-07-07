@@ -1,37 +1,19 @@
 import React, { useState } from 'react';
 import { Lock, AlertCircle } from 'lucide-react';
-import { UserSession } from '../types';
+import { supabase } from '../lib/supabase';
 
-interface LoginProps {
-  onLogin: (session: UserSession) => void;
-}
-
-const MASTER_EMAILS = new Set([
-  'bianca.segato@v4company.com'
-]);
-
-const getEnv = (key: string): string | undefined => {
-  try {
-    // @ts-ignore
-    return import.meta?.env?.[key];
-  } catch (e) {
-    return undefined;
-  }
-};
-
-const MASTER_PASSWORD = getEnv('VITE_MASTER_PASSWORD') || 'Master@V4Karsten2026';
-
-const Login: React.FC<LoginProps> = ({ onLogin }) => {
+const Login: React.FC = () => {
   const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
   const [error, setError] = useState('');
+  const [message, setMessage] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
 
   const normalizedEmail = email.trim().toLowerCase();
-  const isMasterEmail = MASTER_EMAILS.has(normalizedEmail);
 
-  const handleLogin = (e: React.FormEvent) => {
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
+    setMessage('');
 
     if (!email) {
       setError("Por favor, insira um e-mail.");
@@ -43,32 +25,22 @@ const Login: React.FC<LoginProps> = ({ onLogin }) => {
       return;
     }
 
-    const isMaster = isMasterEmail;
+    setIsLoading(true);
+    try {
+      const { error: signInError } = await supabase.auth.signInWithOtp({
+        email: normalizedEmail,
+        options: {
+          emailRedirectTo: window.location.origin
+        }
+      });
 
-    if (isMaster) {
-      if (!MASTER_PASSWORD) {
-        setError("Senha master nao configurada.");
-        return;
-      }
-
-      if (password !== MASTER_PASSWORD) {
-        setError("Senha master invalida.");
-        return;
-      }
+      if (signInError) throw signInError;
+      setMessage("Enviamos um link de acesso para o seu e-mail.");
+    } catch (err: any) {
+      setError(err.message || "Nao foi possivel enviar o link de acesso.");
+    } finally {
+      setIsLoading(false);
     }
-
-    const canEditHealthScore = isMaster;
-    const canEditProductivity = isMaster;
-
-    onLogin({
-      email: normalizedEmail,
-      isMaster,
-      isAuthenticated: true,
-      permissions: {
-        canEditHealthScore,
-        canEditProductivity
-      }
-    });
   };
 
   return (
@@ -98,21 +70,6 @@ const Login: React.FC<LoginProps> = ({ onLogin }) => {
                 onChange={(e) => setEmail(e.target.value)}
               />
             </div>
-            {isMasterEmail && (
-              <div>
-                <label htmlFor="password" className="sr-only">Senha master</label>
-                <input
-                  id="password"
-                  name="password"
-                  type="password"
-                  required
-                  className="appearance-none rounded-b relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 focus:outline-none focus:ring-red-500 focus:border-red-500 sm:text-sm"
-                  placeholder="Senha master"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                />
-              </div>
-            )}
           </div>
 
           {error && (
@@ -121,13 +78,19 @@ const Login: React.FC<LoginProps> = ({ onLogin }) => {
               {error}
             </div>
           )}
+          {message && (
+            <div className="text-green-700 text-sm text-center bg-green-50 p-2 rounded">
+              {message}
+            </div>
+          )}
 
           <div>
             <button
               type="submit"
+              disabled={isLoading}
               className="group relative w-full flex justify-center py-2 px-4 border border-transparent text-sm font-medium rounded-md text-white bg-red-700 hover:bg-red-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500 transition-colors shadow-sm"
             >
-              Entrar
+              {isLoading ? 'Enviando...' : 'Entrar'}
             </button>
           </div>
         </form>
