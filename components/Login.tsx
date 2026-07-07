@@ -7,8 +7,7 @@ interface LoginProps {
 }
 
 const MASTER_EMAILS = new Set([
-  'bianca.segato@v4company.com',
-  'thomas.sobral@v4company.com'
+  'bianca.segato@v4company.com'
 ]);
 
 const getEnv = (key: string): string | undefined => {
